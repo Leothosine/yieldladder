@@ -1,0 +1,12 @@
+{
+  "network": "mainnet",
+  "vaultRouter": "",
+  "vaultFlex": "",
+  "vaultL3": "",
+  "vaultL6": "",
+  "vaultL12": "",
+  "strategyVault": "",
+  "harvester": "",
+  "governance": "",
+  "deployedAt": null
+}
