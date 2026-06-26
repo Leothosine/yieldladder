@@ -78,8 +78,16 @@ jobs:
 
       - name: Install dependencies
         working-directory: sdks/typescript
-        run: pnpm install --frozen-lockfile
+        run: pnpm install
 
       - name: Typecheck
         working-directory: sdks/typescript
         run: pnpm typecheck
+
+      - name: Build
+        working-directory: sdks/typescript
+        run: pnpm build
+
+      - name: Test
+        working-directory: sdks/typescript
+        run: pnpm test

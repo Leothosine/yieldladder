@@ -33,6 +33,8 @@ const VAULT_TIERS = [
   },
 ] as const;
 
+import Link from 'next/link';
+
 function VaultCard(props: (typeof VAULT_TIERS)[number]) {
   return (
     <div style={styles.card}>
@@ -54,9 +56,9 @@ function VaultCard(props: (typeof VAULT_TIERS)[number]) {
           <dd style={styles.dd}>{props.minDeposit}</dd>
         </div>
       </dl>
-      <button style={styles.button} type="button">
+      <Link href={`/deposit?tier=${props.id}`} style={styles.button}>
         Deposit
-      </button>
+      </Link>
     </div>
   );
 }
@@ -151,5 +153,8 @@ const styles = {
     fontWeight: 600,
     cursor: 'pointer',
     fontSize: '0.9rem',
+    textDecoration: 'none',
+    textAlign: 'center' as const,
+    display: 'block',
   },
 } satisfies Record<string, React.CSSProperties | Record<string, React.CSSProperties>>;
