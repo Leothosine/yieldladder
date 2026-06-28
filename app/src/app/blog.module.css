@@ -1,0 +1,162 @@
+.page {
+    min-height: 100vh;
+    background: #060810;
+    color: #f1f5f9;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  }
+  
+  /* ── Nav ── */
+  .nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 1.25rem 2rem;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  }
+  
+  .navLogo {
+    font-size: 1.125rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: #f1f5f9;
+    text-decoration: none;
+  }
+  
+  .navCta {
+    font-size: 0.875rem;
+    color: #94a3b8;
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+  
+  .navCta:hover {
+    color: #f1f5f9;
+  }
+  
+  /* ── Header ── */
+  .header {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 4rem 2rem 2.5rem;
+  }
+  
+  .title {
+    font-size: clamp(2rem, 5vw, 2.75rem);
+    font-weight: 700;
+    letter-spacing: -0.03em;
+    color: #f1f5f9;
+    margin-bottom: 0.75rem;
+  }
+  
+  .sub {
+    font-size: 1.0625rem;
+    color: #94a3b8;
+    line-height: 1.6;
+  }
+  
+  /* ── Feed ── */
+  .feed {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 2rem 4rem;
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+  
+  .post {
+    padding: 2rem 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.07);
+  }
+  
+  .post:last-child {
+    border-bottom: none;
+  }
+  
+  .postMeta {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin-bottom: 0.875rem;
+  }
+  
+  .tag {
+    display: inline-block;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    padding: 0.2rem 0.6rem;
+    border-radius: 4px;
+  }
+  
+  .tagSecurity {
+    background: rgba(234, 88, 12, 0.15);
+    color: #fb923c;
+  }
+  
+  .tagGovernance {
+    background: rgba(99, 102, 241, 0.15);
+    color: #a5b4fc;
+  }
+  
+  .tagProtocol {
+    background: rgba(20, 184, 166, 0.15);
+    color: #5eead4;
+  }
+  
+  .tagPool {
+    background: rgba(34, 197, 94, 0.15);
+    color: #86efac;
+  }
+  
+  .date {
+    font-size: 0.8125rem;
+    color: #64748b;
+  }
+  
+  .postTitle {
+    font-size: 1.3125rem;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    color: #f1f5f9;
+    margin-bottom: 0.625rem;
+    line-height: 1.35;
+  }
+  
+  .postSummary {
+    font-size: 0.9375rem;
+    color: #94a3b8;
+    line-height: 1.65;
+    margin-bottom: 1rem;
+  }
+  
+  .postLink {
+    font-size: 0.875rem;
+    color: #7dd3fc;
+    text-decoration: none;
+    font-weight: 500;
+    transition: color 0.2s;
+  }
+  
+  .postLink:hover {
+    color: #bae6fd;
+  }
+  
+  /* ── Footer ── */
+  .footer {
+    max-width: 720px;
+    margin: 0 auto;
+    padding: 0 2rem 3rem;
+  }
+  
+  .footerBack {
+    font-size: 0.875rem;
+    color: #64748b;
+    text-decoration: none;
+    transition: color 0.2s;
+  }
+  
+  .footerBack:hover {
+    color: #94a3b8;
+  }
