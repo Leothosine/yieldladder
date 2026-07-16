@@ -5,8 +5,10 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, panic_wit
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum VaultError {
-    BelowMinDeposit = 2,
-    LockNotExpired = 3,
+    BelowMinDeposit    = 2,
+    LockNotExpired     = 3,
+    DepositCapExceeded = 5,
+    Unauthorized       = 6,
 }
 
 #[derive(Clone)]
@@ -17,68 +19,83 @@ pub enum DataKey {
     Shares(Address),
     Checkpoint(Address),
     TotalShares,
+    TotalBalance,
     Admin,
+    Governance,
     Strategy,
     Usdc,
+    MaxTvl,
 }
 
-// GF-01 internal mock: fixed-point math
 const FP_MULTIPLIER: i128 = 1_000_000_0;
 
 pub fn mul_fp(a: i128, b_fp: i128) -> i128 {
     (a * b_fp) / FP_MULTIPLIER
 }
 
+const LOCK_DURATION: u32 = 777_600; // 3 months
+
+// Conservative default cap: 1,000,000 USDC (7 decimals)
+const DEFAULT_MAX_TVL: i128 = 1_000_000_0_000_000;
+
 #[contract]
 pub struct VaultL3;
 
 #[contractimpl]
 impl VaultL3 {
-    // 3 months = ~777,600 ledgers at 5s/ledger
-    pub fn initialize(env: Env, admin: Address, strategy: Address, usdc: Address) {
+    pub fn initialize(
+        env: Env,
+        admin: Address,
+        governance: Address,
+        strategy: Address,
+        usdc: Address,
+        max_tvl: i128,
+    ) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Governance, &governance);
         env.storage().instance().set(&DataKey::Strategy, &strategy);
         env.storage().instance().set(&DataKey::Usdc, &usdc);
         env.storage().instance().set(&DataKey::TotalShares, &0i128);
+        env.storage().instance().set(&DataKey::TotalBalance, &0i128);
+        // Use provided cap, falling back to DEFAULT_MAX_TVL if zero
+        let cap = if max_tvl > 0 { max_tvl } else { DEFAULT_MAX_TVL };
+        env.storage().instance().set(&DataKey::MaxTvl, &cap);
     }
 
     pub fn deposit(env: Env, user: Address, amount: i128) {
         user.require_auth();
-        
-        // Min deposit: 50 USDC (assuming 7 decimals like XLM/stroops, 50 * 10^7 = 500,000,000)
-        // Wait, USDC on Stellar has 7 decimals. So 50 USDC is 500_000_000 stroops.
+
         if amount < 500_000_000 {
             panic_with_error!(&env, VaultError::BelowMinDeposit);
         }
 
-        // Multiplier: 1.05x -> 10_500_000 in FP_MULTIPLIER (7 decimals)
+        // TVL cap check: reject if deposit would push total balance over max_tvl
+        let total_balance: i128 = env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0);
+        let max_tvl: i128 = env.storage().instance().get(&DataKey::MaxTvl).unwrap_or(DEFAULT_MAX_TVL);
+        if total_balance + amount > max_tvl {
+            panic_with_error!(&env, VaultError::DepositCapExceeded);
+        }
+
         let multiplier_fp = 10_500_000;
         let new_shares = mul_fp(amount, multiplier_fp);
 
         let usdc_addr: Address = env.storage().instance().get(&DataKey::Usdc).unwrap();
         let strategy: Address = env.storage().instance().get(&DataKey::Strategy).unwrap();
-        
-        // Transfer USDC from user to StrategyVault
         let token_client = token::Client::new(&env, &usdc_addr);
         token_client.transfer(&user, &strategy, &amount);
 
-        // Update user balances and shares
         let current_balance: i128 = env.storage().persistent().get(&DataKey::Balance(user.clone())).unwrap_or(0);
         let current_shares: i128 = env.storage().persistent().get(&DataKey::Shares(user.clone())).unwrap_or(0);
-        
         env.storage().persistent().set(&DataKey::Balance(user.clone()), &(current_balance + amount));
         env.storage().persistent().set(&DataKey::Shares(user.clone()), &(current_shares + new_shares));
-        
+
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares + new_shares));
+        env.storage().instance().set(&DataKey::TotalBalance, &(total_balance + amount));
 
-        // Lock duration: 777,600 ledgers
-        let lock_duration = 777_600;
-        let lock_until = env.ledger().sequence() + lock_duration;
+        let lock_until = env.ledger().sequence() + LOCK_DURATION;
         env.storage().persistent().set(&DataKey::LockUntil(user.clone()), &lock_until);
-
-        // Share-checkpoint (GF-01)
         let checkpoint = env.ledger().sequence() + 1;
         env.storage().persistent().set(&DataKey::Checkpoint(user.clone()), &checkpoint);
     }
@@ -98,22 +115,16 @@ impl VaultL3 {
             return 0;
         }
 
-        // Return principal + yield. Since we don't have StrategyVault interaction defined fully,
-        // and "return principal + pro-rata yield" is required, let's assume we fetch yield from somewhere.
-        // Wait! The issue says: "withdraw(user) -> i128 — assert current_ledger >= lock_until, return principal + pro-rata yield, burn shares"
-        // Since we are not doing full strategy logic, we just return the principal and burn shares.
-        // Actually, if we just return `principal`, that's fine for the unit tests right now because yield generation is external.
-
-        // Burn shares
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+        let total_balance: i128 = env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares - current_shares));
-        
+        env.storage().instance().set(&DataKey::TotalBalance, &(total_balance - principal).max(0));
+
         env.storage().persistent().remove(&DataKey::Balance(user.clone()));
         env.storage().persistent().remove(&DataKey::Shares(user.clone()));
         env.storage().persistent().remove(&DataKey::LockUntil(user.clone()));
         env.storage().persistent().remove(&DataKey::Checkpoint(user.clone()));
 
-        // Return amount. (StrategyVault will transfer the funds in real integration)
         principal
     }
 
@@ -127,21 +138,40 @@ impl VaultL3 {
             return 0;
         }
 
-        // Exit fee: 0.50% = 0.005 = 50_000 in FP_MULTIPLIER
         let exit_fee_fp = 50_000;
         let fee = mul_fp(principal, exit_fee_fp);
         let net_amount = principal - fee;
 
-        // Burn shares
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
+        let total_balance: i128 = env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares - current_shares));
-        
+        env.storage().instance().set(&DataKey::TotalBalance, &(total_balance - principal).max(0));
+
         env.storage().persistent().remove(&DataKey::Balance(user.clone()));
         env.storage().persistent().remove(&DataKey::Shares(user.clone()));
         env.storage().persistent().remove(&DataKey::LockUntil(user.clone()));
         env.storage().persistent().remove(&DataKey::Checkpoint(user.clone()));
 
         net_amount
+    }
+
+    /// Update the max TVL cap. Only callable by the Governance contract address.
+    /// Lowering the cap below current TVL does not affect existing depositors —
+    /// it only prevents new deposits that would exceed the new cap.
+    pub fn set_max_tvl(env: Env, new_cap: i128) {
+        let governance: Address = env.storage().instance().get(&DataKey::Governance).unwrap();
+        governance.require_auth();
+        env.storage().instance().set(&DataKey::MaxTvl, &new_cap);
+    }
+
+    pub fn max_tvl(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::MaxTvl).unwrap_or(DEFAULT_MAX_TVL)
+    }
+
+    pub fn remaining_capacity(env: Env) -> i128 {
+        let max_tvl: i128 = env.storage().instance().get(&DataKey::MaxTvl).unwrap_or(DEFAULT_MAX_TVL);
+        let total_balance: i128 = env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0);
+        (max_tvl - total_balance).max(0)
     }
 
     pub fn lock_until(env: Env, user: Address) -> u32 {
@@ -158,6 +188,10 @@ impl VaultL3 {
 
     pub fn total_shares(env: Env) -> i128 {
         env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0)
+    }
+
+    pub fn total_balance(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::TotalBalance).unwrap_or(0)
     }
 }
 
