@@ -5,8 +5,9 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, panic_wit
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum VaultError {
-    BelowMinDeposit = 2,
-    LockNotExpired = 3,
+    BelowMinDeposit    = 2,
+    LockNotExpired     = 3,
+    AmountExceedsBalance = 7,
 }
 
 #[derive(Clone)]
@@ -22,8 +23,8 @@ pub enum DataKey {
     Usdc,
 }
 
-// GF-01 internal mock: fixed-point math
 const FP_MULTIPLIER: i128 = 1_000_000_0;
+const LOCK_DURATION: u32 = 777_600; // 3 months
 
 pub fn mul_fp(a: i128, b_fp: i128) -> i128 {
     (a * b_fp) / FP_MULTIPLIER
@@ -34,7 +35,6 @@ pub struct VaultL3;
 
 #[contractimpl]
 impl VaultL3 {
-    // 3 months = ~777,600 ledgers at 5s/ledger
     pub fn initialize(env: Env, admin: Address, strategy: Address, usdc: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -45,45 +45,37 @@ impl VaultL3 {
 
     pub fn deposit(env: Env, user: Address, amount: i128) {
         user.require_auth();
-        
-        // Min deposit: 50 USDC (assuming 7 decimals like XLM/stroops, 50 * 10^7 = 500,000,000)
-        // Wait, USDC on Stellar has 7 decimals. So 50 USDC is 500_000_000 stroops.
         if amount < 500_000_000 {
             panic_with_error!(&env, VaultError::BelowMinDeposit);
         }
-
-        // Multiplier: 1.05x -> 10_500_000 in FP_MULTIPLIER (7 decimals)
         let multiplier_fp = 10_500_000;
         let new_shares = mul_fp(amount, multiplier_fp);
 
         let usdc_addr: Address = env.storage().instance().get(&DataKey::Usdc).unwrap();
         let strategy: Address = env.storage().instance().get(&DataKey::Strategy).unwrap();
-        
-        // Transfer USDC from user to StrategyVault
         let token_client = token::Client::new(&env, &usdc_addr);
         token_client.transfer(&user, &strategy, &amount);
 
-        // Update user balances and shares
         let current_balance: i128 = env.storage().persistent().get(&DataKey::Balance(user.clone())).unwrap_or(0);
         let current_shares: i128 = env.storage().persistent().get(&DataKey::Shares(user.clone())).unwrap_or(0);
-        
         env.storage().persistent().set(&DataKey::Balance(user.clone()), &(current_balance + amount));
         env.storage().persistent().set(&DataKey::Shares(user.clone()), &(current_shares + new_shares));
-        
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares + new_shares));
 
-        // Lock duration: 777,600 ledgers
-        let lock_duration = 777_600;
-        let lock_until = env.ledger().sequence() + lock_duration;
+        let lock_until = env.ledger().sequence() + LOCK_DURATION;
         env.storage().persistent().set(&DataKey::LockUntil(user.clone()), &lock_until);
-
-        // Share-checkpoint (GF-01)
         let checkpoint = env.ledger().sequence() + 1;
         env.storage().persistent().set(&DataKey::Checkpoint(user.clone()), &checkpoint);
     }
 
-    pub fn withdraw(env: Env, user: Address) -> i128 {
+    /// Withdraw `amount` from a matured position.
+    ///
+    /// - If `amount >= balance`: full withdrawal — storage entries removed.
+    /// - If `amount < balance`: partial withdrawal — burns proportional shares,
+    ///   reduces Balance/Shares, leaves LockUntil/Checkpoint untouched.
+    /// - If `amount > balance`: rejected with `AmountExceedsBalance`.
+    pub fn withdraw(env: Env, user: Address, amount: i128) -> i128 {
         user.require_auth();
 
         let lock_until: u32 = env.storage().persistent().get(&DataKey::LockUntil(user.clone())).unwrap_or(0);
@@ -91,55 +83,71 @@ impl VaultL3 {
             panic_with_error!(&env, VaultError::LockNotExpired);
         }
 
-        let current_shares: i128 = env.storage().persistent().get(&DataKey::Shares(user.clone())).unwrap_or(0);
-        let principal: i128 = env.storage().persistent().get(&DataKey::Balance(user.clone())).unwrap_or(0);
+        let balance: i128 = env.storage().persistent().get(&DataKey::Balance(user.clone())).unwrap_or(0);
+        let user_shares: i128 = env.storage().persistent().get(&DataKey::Shares(user.clone())).unwrap_or(0);
+        let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
 
-        if current_shares == 0 {
-            return 0;
+        if amount > balance {
+            panic_with_error!(&env, VaultError::AmountExceedsBalance);
         }
 
-        // Return principal + yield. Since we don't have StrategyVault interaction defined fully,
-        // and "return principal + pro-rata yield" is required, let's assume we fetch yield from somewhere.
-        // Wait! The issue says: "withdraw(user) -> i128 — assert current_ledger >= lock_until, return principal + pro-rata yield, burn shares"
-        // Since we are not doing full strategy logic, we just return the principal and burn shares.
-        // Actually, if we just return `principal`, that's fine for the unit tests right now because yield generation is external.
+        if amount >= balance {
+            // Full withdrawal — remove storage entries
+            env.storage().instance().set(&DataKey::TotalShares, &(total_shares - user_shares));
+            env.storage().persistent().remove(&DataKey::Balance(user.clone()));
+            env.storage().persistent().remove(&DataKey::Shares(user.clone()));
+            env.storage().persistent().remove(&DataKey::LockUntil(user.clone()));
+            env.storage().persistent().remove(&DataKey::Checkpoint(user.clone()));
+            return balance;
+        }
 
-        // Burn shares
-        let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - current_shares));
-        
-        env.storage().persistent().remove(&DataKey::Balance(user.clone()));
-        env.storage().persistent().remove(&DataKey::Shares(user.clone()));
-        env.storage().persistent().remove(&DataKey::LockUntil(user.clone()));
-        env.storage().persistent().remove(&DataKey::Checkpoint(user.clone()));
+        // Partial withdrawal — burn proportional shares
+        // shares_to_burn = user_shares * amount / balance
+        let shares_to_burn = (user_shares * amount) / balance;
+        env.storage().persistent().set(&DataKey::Balance(user.clone()), &(balance - amount));
+        env.storage().persistent().set(&DataKey::Shares(user.clone()), &(user_shares - shares_to_burn));
+        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - shares_to_burn));
 
-        // Return amount. (StrategyVault will transfer the funds in real integration)
-        principal
+        amount
     }
 
-    pub fn early_exit(env: Env, user: Address) -> i128 {
+    /// Early exit `amount` before maturity, applying the exit fee only to the
+    /// withdrawn amount.
+    ///
+    /// - If `amount >= balance`: full early exit.
+    /// - If `amount < balance`: partial early exit, remainder stays.
+    /// - If `amount > balance`: rejected with `AmountExceedsBalance`.
+    pub fn early_exit(env: Env, user: Address, amount: i128) -> i128 {
         user.require_auth();
 
-        let current_shares: i128 = env.storage().persistent().get(&DataKey::Shares(user.clone())).unwrap_or(0);
-        let principal: i128 = env.storage().persistent().get(&DataKey::Balance(user.clone())).unwrap_or(0);
+        let balance: i128 = env.storage().persistent().get(&DataKey::Balance(user.clone())).unwrap_or(0);
+        let user_shares: i128 = env.storage().persistent().get(&DataKey::Shares(user.clone())).unwrap_or(0);
+        let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
 
-        if current_shares == 0 {
-            return 0;
+        if amount > balance {
+            panic_with_error!(&env, VaultError::AmountExceedsBalance);
         }
 
-        // Exit fee: 0.50% = 0.005 = 50_000 in FP_MULTIPLIER
+        // Exit fee: 0.50% on the withdrawn amount only
         let exit_fee_fp = 50_000;
-        let fee = mul_fp(principal, exit_fee_fp);
-        let net_amount = principal - fee;
+        let fee = mul_fp(amount, exit_fee_fp);
+        let net_amount = amount - fee;
 
-        // Burn shares
-        let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
-        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - current_shares));
-        
-        env.storage().persistent().remove(&DataKey::Balance(user.clone()));
-        env.storage().persistent().remove(&DataKey::Shares(user.clone()));
-        env.storage().persistent().remove(&DataKey::LockUntil(user.clone()));
-        env.storage().persistent().remove(&DataKey::Checkpoint(user.clone()));
+        if amount >= balance {
+            // Full early exit
+            env.storage().instance().set(&DataKey::TotalShares, &(total_shares - user_shares));
+            env.storage().persistent().remove(&DataKey::Balance(user.clone()));
+            env.storage().persistent().remove(&DataKey::Shares(user.clone()));
+            env.storage().persistent().remove(&DataKey::LockUntil(user.clone()));
+            env.storage().persistent().remove(&DataKey::Checkpoint(user.clone()));
+            return net_amount;
+        }
+
+        // Partial early exit
+        let shares_to_burn = (user_shares * amount) / balance;
+        env.storage().persistent().set(&DataKey::Balance(user.clone()), &(balance - amount));
+        env.storage().persistent().set(&DataKey::Shares(user.clone()), &(user_shares - shares_to_burn));
+        env.storage().instance().set(&DataKey::TotalShares, &(total_shares - shares_to_burn));
 
         net_amount
     }
