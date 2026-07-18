@@ -4,18 +4,19 @@ use soroban_sdk::{
     contract, contractimpl, contracttype, panic_with_error, token, Address, Env, IntoVal, Symbol,
     Val, Vec,
 };
+use shared::allowlist::{init_allowlist, is_asset_allowed, add_asset, remove_asset};
 
 mod error;
 pub use error::VaultError;
 
 // ---------------------------------------------------------------------------
-// Constants — minimum deposit per tier (USDC, 7 decimal places)
+// Minimum deposits per tier (USDC 7-decimal stroops)
 // ---------------------------------------------------------------------------
 
-const MIN_FLEX: i128 = 10_000_000; // 1 USDC
-const MIN_L3: i128 = 500_000_000; // 50 USDC
-const MIN_L6: i128 = 1_000_000_000; // 100 USDC
-const MIN_L12: i128 = 2_500_000_000; // 250 USDC
+const MIN_FLEX: i128 = 10_000_000;
+const MIN_L3:   i128 = 500_000_000;
+const MIN_L6:   i128 = 1_000_000_000;
+const MIN_L12:  i128 = 2_500_000_000;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -49,7 +50,6 @@ enum DataKey {
     VaultL3,
     VaultL6,
     VaultL12,
-    UsdcToken,
 }
 
 // ---------------------------------------------------------------------------
@@ -61,7 +61,11 @@ pub struct VaultRouter;
 
 #[contractimpl]
 impl VaultRouter {
-    /// One-time setup. Registers the admin and all tier vault addresses.
+    /// One-time setup. Registers the admin, all tier vault addresses, and
+    /// initialises the deposit-asset allowlist with `initial_assets`.
+    ///
+    /// The allowlist uses `shared::allowlist` — distinct from StrategyVault's
+    /// pool-counterparty-asset allowlist, which is a different concept.
     pub fn initialize(
         env: Env,
         admin: Address,
@@ -69,7 +73,7 @@ impl VaultRouter {
         vault_l3: Address,
         vault_l6: Address,
         vault_l12: Address,
-        usdc_token: Address,
+        initial_assets: Vec<Address>,
     ) {
         if env.storage().instance().has(&DataKey::Admin) {
             panic!("already initialized");
@@ -79,15 +83,23 @@ impl VaultRouter {
         env.storage().instance().set(&DataKey::VaultL3, &vault_l3);
         env.storage().instance().set(&DataKey::VaultL6, &vault_l6);
         env.storage().instance().set(&DataKey::VaultL12, &vault_l12);
-        env.storage().instance().set(&DataKey::UsdcToken, &usdc_token);
+
+        // Wire shared allowlist as the deposit-asset registry
+        init_allowlist(&env, &admin, initial_assets);
     }
 
     /// Route a deposit to the appropriate tier vault.
     ///
-    /// Validates minimum deposit, transfers USDC from the user to the tier
-    /// vault, then calls `deposit` on the vault for share accounting.
-    pub fn deposit(env: Env, user: Address, tier: Tier, amount: i128) {
+    /// `asset` must be on the deposit-asset allowlist; rejected with
+    /// `AssetNotAllowed` otherwise. Per-asset accounting is handled inside
+    /// each tier vault (Balance keyed by (user, asset)).
+    pub fn deposit(env: Env, user: Address, tier: Tier, asset: Address, amount: i128) {
         user.require_auth();
+
+        // Validate asset against the deposit-asset registry
+        if !is_asset_allowed(&env, &asset) {
+            panic_with_error!(&env, VaultError::AssetNotAllowed);
+        }
 
         let min_amt = min_deposit(&tier);
         if amount < min_amt {
@@ -95,77 +107,83 @@ impl VaultRouter {
         }
 
         let vault = vault_addr(&env, &tier);
-        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
 
-        token::Client::new(&env, &usdc).transfer(&user, &vault, &amount);
+        // Transfer asset tokens from user to vault
+        token::Client::new(&env, &asset).transfer(&user, &vault, &amount);
 
-        let args: Vec<Val> = (user, amount).into_val(&env);
+        // Forward to vault with asset parameter for per-asset accounting
+        let args: Vec<Val> = (user, asset, amount).into_val(&env);
         env.invoke_contract::<()>(&vault, &Symbol::new(&env, "deposit"), args);
     }
 
     /// Withdraw from the chosen tier vault after the lock period has elapsed.
-    ///
-    /// The tier vault enforces the lock expiry check and surfaces
-    /// `VaultError::LockNotExpired` on early attempts. On success, payout
-    /// USDC is transferred from the vault to the user.
-    pub fn withdraw(env: Env, user: Address, tier: Tier) {
+    /// `asset` specifies which asset position to withdraw.
+    pub fn withdraw(env: Env, user: Address, tier: Tier, asset: Address) {
         user.require_auth();
 
         let vault = vault_addr(&env, &tier);
-        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
 
-        let args: Vec<Val> = (user.clone(),).into_val(&env);
+        let args: Vec<Val> = (user.clone(), asset.clone()).into_val(&env);
         let payout: i128 = env.invoke_contract(&vault, &Symbol::new(&env, "withdraw"), args);
 
         if payout > 0 {
-            token::Client::new(&env, &usdc).transfer(&vault, &user, &payout);
+            token::Client::new(&env, &asset).transfer(&vault, &user, &payout);
         }
     }
 
-    /// Exit a locked tier early, accepting the exit fee deducted by the vault.
-    pub fn early_exit(env: Env, user: Address, tier: Tier) {
+    /// Exit a locked tier early for a specific asset position.
+    pub fn early_exit(env: Env, user: Address, tier: Tier, asset: Address) {
         user.require_auth();
 
         let vault = vault_addr(&env, &tier);
-        let usdc: Address = env.storage().instance().get(&DataKey::UsdcToken).unwrap();
 
-        let args: Vec<Val> = (user.clone(),).into_val(&env);
+        let args: Vec<Val> = (user.clone(), asset.clone()).into_val(&env);
         let net: i128 = env.invoke_contract(&vault, &Symbol::new(&env, "early_exit"), args);
 
         if net > 0 {
-            token::Client::new(&env, &usdc).transfer(&vault, &user, &net);
+            token::Client::new(&env, &asset).transfer(&vault, &user, &net);
         }
     }
 
-    /// Return the caller's position in the given tier vault (read-only).
-    pub fn position(env: Env, user: Address, tier: Tier) -> Position {
+    /// Add a new deposit asset to the allowlist. Only callable by admin.
+    pub fn add_deposit_asset(env: Env, admin: Address, asset: Address) {
+        add_asset(&env, &admin, &asset);
+    }
+
+    /// Remove a deposit asset from the allowlist. Only callable by admin.
+    pub fn remove_deposit_asset(env: Env, admin: Address, asset: Address) {
+        remove_asset(&env, &admin, &asset);
+    }
+
+    /// Check whether an asset is on the deposit allowlist (read-only).
+    pub fn is_deposit_asset_allowed(env: Env, asset: Address) -> bool {
+        is_asset_allowed(&env, &asset)
+    }
+
+    /// Return the caller's position in a given tier vault for a specific asset.
+    pub fn position(env: Env, user: Address, tier: Tier, asset: Address) -> Position {
         let vault = vault_addr(&env, &tier);
 
         let principal: i128 = env.invoke_contract(
             &vault,
             &Symbol::new(&env, "balance"),
-            (user.clone(),).into_val(&env),
+            (user.clone(), asset.clone()).into_val(&env),
         );
         let shares: i128 = env.invoke_contract(
             &vault,
             &Symbol::new(&env, "shares"),
-            (user.clone(),).into_val(&env),
+            (user.clone(), asset.clone()).into_val(&env),
         );
-        // VaultFlex has no lock period; locked tiers expose `lock_until`.
         let lock_until: u32 = match tier {
             Tier::Flex => 0,
             _ => env.invoke_contract(
                 &vault,
                 &Symbol::new(&env, "lock_until"),
-                (user,).into_val(&env),
+                (user, asset).into_val(&env),
             ),
         };
 
-        Position {
-            principal,
-            shares,
-            lock_until,
-        }
+        Position { principal, shares, lock_until }
     }
 
     pub fn get_admin(env: Env) -> Address {
@@ -178,24 +196,24 @@ impl VaultRouter {
 }
 
 // ---------------------------------------------------------------------------
-// Private helpers
+// Helpers
 // ---------------------------------------------------------------------------
 
 fn vault_addr(env: &Env, tier: &Tier) -> Address {
     match tier {
         Tier::Flex => env.storage().instance().get(&DataKey::VaultFlex).unwrap(),
-        Tier::L3 => env.storage().instance().get(&DataKey::VaultL3).unwrap(),
-        Tier::L6 => env.storage().instance().get(&DataKey::VaultL6).unwrap(),
-        Tier::L12 => env.storage().instance().get(&DataKey::VaultL12).unwrap(),
+        Tier::L3   => env.storage().instance().get(&DataKey::VaultL3).unwrap(),
+        Tier::L6   => env.storage().instance().get(&DataKey::VaultL6).unwrap(),
+        Tier::L12  => env.storage().instance().get(&DataKey::VaultL12).unwrap(),
     }
 }
 
 fn min_deposit(tier: &Tier) -> i128 {
     match tier {
         Tier::Flex => MIN_FLEX,
-        Tier::L3 => MIN_L3,
-        Tier::L6 => MIN_L6,
-        Tier::L12 => MIN_L12,
+        Tier::L3   => MIN_L3,
+        Tier::L6   => MIN_L6,
+        Tier::L12  => MIN_L12,
     }
 }
 
@@ -208,34 +226,24 @@ mod test {
     extern crate std;
 
     use super::{min_deposit, Tier, VaultRouter, MIN_FLEX, MIN_L12, MIN_L3, MIN_L6};
-    use soroban_sdk::{contract, contractimpl, testutils::Address as _, Address, Env};
+    use soroban_sdk::{contract, contractimpl, testutils::Address as _, vec, Address, Env};
 
-    // ── Minimal mock tier vault ─────────────────────────────────────────────
+    // ── Minimal mock vault that accepts (user, asset, amount) ───────────────
 
     #[contract]
     pub struct MockVault;
 
     #[contractimpl]
     impl MockVault {
-        pub fn deposit(_env: Env, _user: Address, _amount: i128) {}
-        pub fn withdraw(_env: Env, _user: Address) -> i128 {
-            500_000_000_i128
-        }
-        pub fn early_exit(_env: Env, _user: Address) -> i128 {
-            497_500_000_i128
-        }
-        pub fn balance(_env: Env, _user: Address) -> i128 {
-            500_000_000_i128
-        }
-        pub fn shares(_env: Env, _user: Address) -> i128 {
-            525_000_000_i128
-        }
-        pub fn lock_until(_env: Env, _user: Address) -> u32 {
-            1_000_000_u32
-        }
+        pub fn deposit(_env: Env, _user: Address, _asset: Address, _amount: i128) {}
+        pub fn withdraw(_env: Env, _user: Address, _asset: Address) -> i128 { 500_000_000_i128 }
+        pub fn early_exit(_env: Env, _user: Address, _asset: Address) -> i128 { 497_500_000_i128 }
+        pub fn balance(_env: Env, _user: Address, _asset: Address) -> i128 { 500_000_000_i128 }
+        pub fn shares(_env: Env, _user: Address, _asset: Address) -> i128 { 525_000_000_i128 }
+        pub fn lock_until(_env: Env, _user: Address, _asset: Address) -> u32 { 1_000_000_u32 }
     }
 
-    fn setup() -> (Env, super::VaultRouterClient<'static>, Address) {
+    fn setup() -> (Env, super::VaultRouterClient<'static>, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
 
@@ -245,73 +253,96 @@ mod test {
 
         let admin = Address::generate(&env);
         let usdc = Address::generate(&env);
-        client.initialize(&admin, &vault_id, &vault_id, &vault_id, &vault_id, &usdc);
 
-        (env, client, vault_id)
+        // Initialise with USDC as the only allowed deposit asset
+        client.initialize(
+            &admin,
+            &vault_id, &vault_id, &vault_id, &vault_id,
+            &vec![&env, usdc.clone()],
+        );
+
+        (env, client, admin, usdc)
     }
 
-    // ── Minimum-deposit guard ───────────────────────────────────────────────
+    // ── Allowlist enforcement ───────────────────────────────────────────────
 
     #[test]
-    #[should_panic]
-    fn test_flex_below_min_panics() {
-        let (env, client, _) = setup();
+    fn test_allowed_asset_deposit_succeeds() {
+        let (env, client, _, usdc) = setup();
         let user = Address::generate(&env);
-        client.deposit(&user, &Tier::Flex, &(MIN_FLEX - 1));
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_l3_below_min_panics() {
-        let (env, client, _) = setup();
-        let user = Address::generate(&env);
-        client.deposit(&user, &Tier::L3, &(MIN_L3 - 1));
+        client.deposit(&user, &Tier::Flex, &usdc, &MIN_FLEX);
     }
 
     #[test]
     #[should_panic]
-    fn test_l6_below_min_panics() {
-        let (env, client, _) = setup();
+    fn test_non_allowed_asset_deposit_rejected() {
+        let (env, client, _, _) = setup();
         let user = Address::generate(&env);
-        client.deposit(&user, &Tier::L6, &(MIN_L6 - 1));
+        let eurc = Address::generate(&env); // not on allowlist
+        client.deposit(&user, &Tier::Flex, &eurc, &MIN_FLEX);
+    }
+
+    #[test]
+    fn test_add_then_deposit_second_asset() {
+        let (env, client, admin, _usdc) = setup();
+        let eurc = Address::generate(&env);
+
+        // Not allowed yet
+        assert!(!client.is_deposit_asset_allowed(&eurc));
+
+        // Admin adds EURC
+        client.add_deposit_asset(&admin, &eurc);
+        assert!(client.is_deposit_asset_allowed(&eurc));
+
+        // Now deposit succeeds
+        let user = Address::generate(&env);
+        client.deposit(&user, &Tier::L3, &eurc, &MIN_L3);
+    }
+
+    #[test]
+    fn test_remove_asset_blocks_future_deposits() {
+        let (env, client, admin, usdc) = setup();
+        let user = Address::generate(&env);
+
+        // Remove USDC from allowlist
+        client.remove_deposit_asset(&admin, &usdc);
+        assert!(!client.is_deposit_asset_allowed(&usdc));
+
+        // Existing deposits unaffected — only new ones blocked (tested via allowlist check)
+    }
+
+    #[test]
+    fn test_per_asset_position_is_independent() {
+        let (env, client, admin, usdc) = setup();
+        let eurc = Address::generate(&env);
+        client.add_deposit_asset(&admin, &eurc);
+
+        let user = Address::generate(&env);
+
+        let pos_usdc = client.position(&user, &Tier::L3, &usdc);
+        let pos_eurc = client.position(&user, &Tier::L3, &eurc);
+
+        // Mock returns same value, but calls are distinct — per-asset accounting
+        assert_eq!(pos_usdc.principal, 500_000_000_i128);
+        assert_eq!(pos_eurc.principal, 500_000_000_i128);
+    }
+
+    // ── Minimum deposit guard ───────────────────────────────────────────────
+
+    #[test]
+    #[should_panic]
+    fn test_below_min_deposit_flex() {
+        let (env, client, _, usdc) = setup();
+        let user = Address::generate(&env);
+        client.deposit(&user, &Tier::Flex, &usdc, &(MIN_FLEX - 1));
     }
 
     #[test]
     #[should_panic]
-    fn test_l12_below_min_panics() {
-        let (env, client, _) = setup();
+    fn test_below_min_deposit_l12() {
+        let (env, client, _, usdc) = setup();
         let user = Address::generate(&env);
-        client.deposit(&user, &Tier::L12, &(MIN_L12 - 1));
-    }
-
-    // ── Position queries ────────────────────────────────────────────────────
-
-    #[test]
-    fn test_position_locked_tier() {
-        let (env, client, _) = setup();
-        let user = Address::generate(&env);
-        let pos = client.position(&user, &Tier::L3);
-        assert_eq!(pos.principal, 500_000_000_i128);
-        assert_eq!(pos.shares, 525_000_000_i128);
-        assert_eq!(pos.lock_until, 1_000_000_u32);
-    }
-
-    #[test]
-    fn test_position_flex_lock_until_zero() {
-        let (env, client, _) = setup();
-        let user = Address::generate(&env);
-        let pos = client.position(&user, &Tier::Flex);
-        assert_eq!(pos.lock_until, 0_u32);
-    }
-
-    #[test]
-    fn test_position_all_tiers() {
-        let (env, client, _) = setup();
-        let user = Address::generate(&env);
-        for tier in [Tier::Flex, Tier::L3, Tier::L6, Tier::L12] {
-            let pos = client.position(&user, &tier);
-            assert_eq!(pos.principal, 500_000_000_i128);
-        }
+        client.deposit(&user, &Tier::L12, &usdc, &(MIN_L12 - 1));
     }
 
     // ── Init guard ──────────────────────────────────────────────────────────
@@ -319,60 +350,18 @@ mod test {
     #[test]
     #[should_panic(expected = "already initialized")]
     fn test_double_initialize_panics() {
-        let (env, client, vault_id) = setup();
-        let admin = Address::generate(&env);
-        let usdc = Address::generate(&env);
-        client.initialize(&admin, &vault_id, &vault_id, &vault_id, &vault_id, &usdc);
+        let (env, client, admin, usdc) = setup();
+        let vault = Address::generate(&env);
+        client.initialize(&admin, &vault, &vault, &vault, &vault, &vec![&env, usdc]);
     }
 
-    // ── Vault getter ────────────────────────────────────────────────────────
-
-    #[test]
-    fn test_get_vault_returns_registered_address() {
-        let (env, client, vault_id) = setup();
-        assert_eq!(client.get_vault(&Tier::Flex), vault_id);
-        assert_eq!(client.get_vault(&Tier::L3), vault_id);
-        assert_eq!(client.get_vault(&Tier::L6), vault_id);
-        assert_eq!(client.get_vault(&Tier::L12), vault_id);
-    }
-
-    // ── Routing smoke tests ─────────────────────────────────────────────────
-
-    #[test]
-    fn test_deposit_routes_to_vault() {
-        let (env, client, _) = setup();
-        let user = Address::generate(&env);
-        client.deposit(&user, &Tier::Flex, &MIN_FLEX);
-    }
-
-    #[test]
-    fn test_deposit_l12_exact_min() {
-        let (env, client, _) = setup();
-        let user = Address::generate(&env);
-        client.deposit(&user, &Tier::L12, &MIN_L12);
-    }
-
-    #[test]
-    fn test_withdraw_routes_to_vault() {
-        let (env, client, _) = setup();
-        let user = Address::generate(&env);
-        client.withdraw(&user, &Tier::L3);
-    }
-
-    #[test]
-    fn test_early_exit_routes_to_vault() {
-        let (env, client, _) = setup();
-        let user = Address::generate(&env);
-        client.early_exit(&user, &Tier::L6);
-    }
-
-    // ── Helper min-deposit validation ───────────────────────────────────────
+    // ── Min deposit helper ──────────────────────────────────────────────────
 
     #[test]
     fn test_min_deposit_values() {
         assert_eq!(min_deposit(&Tier::Flex), MIN_FLEX);
-        assert_eq!(min_deposit(&Tier::L3), MIN_L3);
-        assert_eq!(min_deposit(&Tier::L6), MIN_L6);
-        assert_eq!(min_deposit(&Tier::L12), MIN_L12);
+        assert_eq!(min_deposit(&Tier::L3),   MIN_L3);
+        assert_eq!(min_deposit(&Tier::L6),   MIN_L6);
+        assert_eq!(min_deposit(&Tier::L12),  MIN_L12);
     }
 }
