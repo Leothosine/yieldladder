@@ -5,9 +5,10 @@ use soroban_sdk::{contract, contracterror, contractimpl, contracttype, panic_wit
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum VaultError {
-    BelowMinDeposit    = 2,
-    LockNotExpired     = 3,
-    Unauthorized       = 4,
+    BelowMinDeposit = 2,
+    LockNotExpired  = 3,
+    NotYetMatured   = 4,
+    Unauthorized    = 5,
 }
 
 #[derive(Clone)]
@@ -34,12 +35,14 @@ pub fn mul_fp(a: i128, b_fp: i128) -> i128 {
     (a * b_fp) / FP_MULTIPLIER
 }
 
+// 3-month lock duration in ledgers (~5 s/ledger)
+const LOCK_DURATION: u32 = 777_600;
+
 #[contract]
 pub struct VaultL3;
 
 #[contractimpl]
 impl VaultL3 {
-    // 3 months = ~777,600 ledgers at 5s/ledger
     pub fn initialize(env: Env, admin: Address, guardian: Address, strategy: Address, usdc: Address) {
         admin.require_auth();
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -100,7 +103,7 @@ impl VaultL3 {
         let total_shares: i128 = env.storage().instance().get(&DataKey::TotalShares).unwrap_or(0);
         env.storage().instance().set(&DataKey::TotalShares, &(total_shares + new_shares));
 
-        let lock_until = env.ledger().sequence() + 777_600;
+        let lock_until = env.ledger().sequence() + LOCK_DURATION;
         env.storage().persistent().set(&DataKey::LockUntil(user.clone()), &lock_until);
 
         let checkpoint = env.ledger().sequence() + 1;
@@ -175,6 +178,35 @@ impl VaultL3 {
         env.storage().persistent().remove(&DataKey::Checkpoint(user.clone()));
 
         net_amount
+    }
+
+    /// Renew the lock on a matured position without touching Balance or Shares.
+    ///
+    /// Callable only when `current_ledger >= lock_until` (position has matured).
+    /// Resets `lock_until = current_ledger + LOCK_DURATION` in place.
+    /// No USDC transfer occurs — this is a pure lock-extension.
+    ///
+    /// Returns the new `lock_until` ledger sequence number.
+    pub fn relock(env: Env, user: Address) -> u32 {
+        user.require_auth();
+
+        let lock_until: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::LockUntil(user.clone()))
+            .unwrap_or(0);
+
+        // Reject if the position has not yet reached maturity
+        if env.ledger().sequence() < lock_until {
+            panic_with_error!(&env, VaultError::NotYetMatured);
+        }
+
+        let new_lock_until = env.ledger().sequence() + LOCK_DURATION;
+        env.storage()
+            .persistent()
+            .set(&DataKey::LockUntil(user.clone()), &new_lock_until);
+
+        new_lock_until
     }
 
     pub fn lock_until(env: Env, user: Address) -> u32 {

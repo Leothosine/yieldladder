@@ -114,6 +114,72 @@ fn test_early_exit_during_emergency_unlock_no_fee() {
     assert_eq!(returned, amount);
 }
 
+// ── relock tests ────────────────────────────────────────────────────────────
+
+#[test]
+fn test_relock_at_maturity_sets_new_lock_until() {
+    let (env, client, _admin, _guardian, _strategy, _usdc) = setup();
+    let user = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let amount = 500_000_000i128;
+    client.deposit(&user, &amount);
+
+    // Fast-forward exactly to maturity
+    let deposit_seq = env.ledger().sequence();
+    env.ledger().with_mut(|l| l.sequence_number = deposit_seq + 777_600);
+
+    let new_lock = client.relock(&user);
+    let expected = env.ledger().sequence() + 777_600;
+    assert_eq!(new_lock, expected);
+    assert_eq!(client.lock_until(&user), expected);
+}
+
+#[test]
+fn test_relock_does_not_change_balance_or_shares() {
+    let (env, client, _admin, _guardian, _strategy, _usdc) = setup();
+    let user = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let amount = 500_000_000i128;
+    client.deposit(&user, &amount);
+
+    let shares_before = client.shares(&user);
+    let balance_before = client.balance(&user);
+    let total_before = client.total_shares();
+
+    let deposit_seq = env.ledger().sequence();
+    env.ledger().with_mut(|l| l.sequence_number = deposit_seq + 777_600);
+
+    client.relock(&user);
+
+    assert_eq!(client.shares(&user), shares_before);
+    assert_eq!(client.balance(&user), balance_before);
+    assert_eq!(client.total_shares(), total_before);
+}
+
+#[test]
+#[should_panic(expected = "NotYetMatured")]
+fn test_relock_before_maturity_is_rejected() {
+    let (env, client, _admin, _guardian, _strategy, _usdc) = setup();
+    let user = Address::generate(&env);
+
+    env.mock_all_auths();
+
+    let amount = 500_000_000i128;
+    client.deposit(&user, &amount);
+
+    // Try to relock while still locked (one ledger before maturity)
+    let deposit_seq = env.ledger().sequence();
+    env.ledger().with_mut(|l| l.sequence_number = deposit_seq + 777_599);
+
+    client.relock(&user);
+}
+
+// ── Emergency withdraw / deactivation tests ──────────────────────────────────
+
 #[test]
 fn test_withdraw_during_emergency_unlock_skips_lock_check() {
     let (env, client, _admin, _guardian, _strategy, _usdc) = setup();
