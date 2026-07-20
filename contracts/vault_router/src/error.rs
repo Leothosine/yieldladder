@@ -8,5 +8,6 @@ pub enum VaultError {
     InvalidTier        = 1,
     BelowMinDeposit    = 2,
     LockNotExpired     = 3,
+    AssetNotAllowed    = 4,
     DepositCapExceeded = 5,
 }
