@@ -9,6 +9,7 @@ members = [
     "contracts/harvester",
     "contracts/governance",
     "contracts/shared",
+    "contracts/position_token",
 ]
 resolver = "2"
 
