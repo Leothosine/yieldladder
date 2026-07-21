@@ -505,6 +505,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "guardian_multisig"
+version = "0.1.0"
+dependencies = [
+ "soroban-sdk",
+]
+
+[[package]]
 name = "harvester"
 version = "0.3.0"
 dependencies = [
